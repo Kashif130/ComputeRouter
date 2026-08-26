@@ -145,6 +145,7 @@ tailwind.config = {
           </div>
           <p id="route-provider" class="text-heading font-display text-lg font-bold"></p>
           <p id="route-reasoning" class="text-sm text-body mt-2 italic"></p>
+          <pre id="route-debug" class="hidden mt-3 pt-3 border-t border-border text-[10px] text-body font-mono whitespace-pre-wrap break-all max-h-64 overflow-y-auto"></pre>
         </div>
 
         <h3 class="text-heading font-semibold text-xs mb-3">Candidate Providers</h3>
@@ -272,6 +273,36 @@ function net() { return NETWORKS[currentNetwork]; }
 function explorerTxUrl(hash) { return net().explorer ? `${net().explorer}/txs/${hash}` : null; }
 function explorerAddrUrl(addr) { return net().explorer ? `${net().explorer}/address/${addr}` : null; }
 function shortAddr(a) { return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : ''; }
+
+// Try to find the contract's JSON-string return value inside a receipt.
+// genlayer-js receipt shapes have varied across versions/networks, so this
+// checks every plausible location instead of assuming one. Returns
+// { parsed, raw } — parsed is the decoded object (or null if not found),
+// raw is always the full receipt for on-screen debugging as a fallback.
+function extractContractResult(receipt) {
+  const candidates = [
+    receipt?.data,
+    receipt?.result,
+    receipt?.data?.result,
+    receipt?.result?.data,
+    receipt?.data?.return_data,
+    receipt?.result?.return_data,
+    receipt?.txDataDecoded?.result,
+    receipt?.txDataDecoded?.return_data,
+    receipt?.decoded_data,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string') {
+      const s = c.trim();
+      if (s.startsWith('{') || s.startsWith('[')) {
+        try { return { parsed: JSON.parse(s), raw: receipt }; } catch (e) { /* keep looking */ }
+      }
+    } else if (c && typeof c === 'object' && ('provider' in c || 'status' in c || 'completed' in c)) {
+      return { parsed: c, raw: receipt };
+    }
+  }
+  return { parsed: null, raw: receipt };
+}
 
 // ─── Tabs ───────────────────────────────────────────────────────────────
 window.switchTab = function(tab) {
@@ -530,19 +561,29 @@ window.routeJob = async function() {
       ],
       value: BigInt(0),
     });
-    const receipt = await writeClient.waitForTransactionReceipt({ hash: txHash, retries: 60, interval: 5000 });
-    const resultRaw = receipt.data || receipt.result;
-    const result = typeof resultRaw === 'string' ? JSON.parse(resultRaw) : resultRaw;
+    const receipt = await writeClient.waitForTransactionReceipt({ hash: txHash, status: 'ACCEPTED', retries: 60, interval: 5000 });
+    const { parsed: result, raw } = extractContractResult(receipt);
 
-    document.getElementById('route-provider').textContent = result.provider || '?';
-    document.getElementById('route-reasoning').textContent = result.reasoning || '';
+    const debugEl = document.getElementById('route-debug');
+    if (!result) {
+      document.getElementById('route-provider').textContent = 'Routed — result format unrecognized';
+      document.getElementById('route-reasoning').textContent = 'Couldn\'t auto-parse the response. Raw receipt below — please share this so the parsing can be fixed:';
+      debugEl.textContent = JSON.stringify(raw, (k, v) => typeof v === 'bigint' ? v.toString() : v, 2);
+      debugEl.classList.remove('hidden');
+    } else {
+      document.getElementById('route-provider').textContent = result.provider || '?';
+      document.getElementById('route-reasoning').textContent = result.reasoning || '';
+      debugEl.classList.add('hidden');
+    }
     const txLink = document.getElementById('route-tx-link');
     const url = explorerTxUrl(txHash);
     if (url) { txLink.href = url; txLink.classList.remove('hidden'); } else { txLink.classList.add('hidden'); }
 
-    document.querySelectorAll('.provider-card').forEach(c => c.classList.remove('chosen'));
-    const chosenCard = document.getElementById(`pcard-${result.provider}`);
-    if (chosenCard) chosenCard.classList.add('chosen');
+    if (result) {
+      document.querySelectorAll('.provider-card').forEach(c => c.classList.remove('chosen'));
+      const chosenCard = document.getElementById(`pcard-${result.provider}`);
+      if (chosenCard) chosenCard.classList.add('chosen');
+    }
 
     document.getElementById('route-result').classList.remove('hidden');
   } catch (e) {
@@ -572,7 +613,7 @@ window.fundEscrow = async function() {
     const tx = await writeClient.writeContract({
       address: net().router, functionName: 'fund_escrow', args: [jobId, providerId, amount], value: BigInt(0),
     });
-    await writeClient.waitForTransactionReceipt({ hash: tx, retries: 60, interval: 5000 });
+    await writeClient.waitForTransactionReceipt({ hash: tx, status: 'ACCEPTED', retries: 60, interval: 5000 });
     document.getElementById('escrow-result').innerHTML = `<p class="text-accent">Escrow locked for ${jobId}.</p>`;
   } catch (e) {
     console.error(e);
@@ -592,9 +633,15 @@ window.resolveCompletion = async function() {
     const tx = await writeClient.writeContract({
       address: net().router, functionName: 'resolve_completion', args: [jobId, evidence], value: BigInt(0),
     });
-    const receipt = await writeClient.waitForTransactionReceipt({ hash: tx, retries: 60, interval: 5000 });
-    const resultRaw = receipt.data || receipt.result;
-    const result = typeof resultRaw === 'string' ? JSON.parse(resultRaw) : resultRaw;
+    const receipt = await writeClient.waitForTransactionReceipt({ hash: tx, status: 'ACCEPTED', retries: 60, interval: 5000 });
+    const { parsed: result, raw } = extractContractResult(receipt);
+    if (!result) {
+      document.getElementById('escrow-result').innerHTML = `
+        <p class="text-coral">Couldn't auto-parse the response. Raw receipt below — please share this:</p>
+        <pre class="mt-2 text-[10px] font-mono whitespace-pre-wrap break-all max-h-64 overflow-y-auto">${JSON.stringify(raw, (k, v) => typeof v === 'bigint' ? v.toString() : v, 2)}</pre>
+      `;
+      return;
+    }
     const color = result.status === 'released' ? 'text-accent' : 'text-coral';
     document.getElementById('escrow-result').innerHTML = `
       <p class="${color} font-semibold">Status: ${result.status}</p>
