@@ -50,6 +50,7 @@ tailwind.config = {
   input[type=range] { accent-color: #5EEAD4; }
   ::-webkit-scrollbar { width: 6px; height: 6px; }
   ::-webkit-scrollbar-thumb { background: #232B3D; border-radius: 3px; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>
 </head>
 <body class="min-h-screen font-sans text-body">
@@ -76,9 +77,10 @@ tailwind.config = {
     <div class="flex items-center gap-3 text-xs">
       <select id="network-select" onchange="switchNetwork()" class="px-2 py-0.5 rounded text-[9px] font-mono text-body bg-warm border border-border cursor-pointer">
         <option value="bradbury">Bradbury Testnet</option>
-        <option value="studionet">Studionet</option>
+        <option value="studio">GenLayer Studio</option>
       </select>
-      <span id="status-badge" class="px-2.5 py-1 rounded-full text-[10px] font-medium bg-warm text-body">Connecting</span>
+      <span id="status-badge" class="px-2.5 py-1 rounded-full text-[10px] font-medium bg-warm text-body">Read-only</span>
+      <button id="wallet-btn" onclick="openWalletModal()" class="px-3 py-1 rounded text-[11px] font-semibold bg-accent text-bg hover:opacity-90 transition-opacity">Connect Wallet</button>
     </div>
   </div>
 </header>
@@ -172,7 +174,7 @@ tailwind.config = {
         <input id="escrow-provider-id" type="text" placeholder="vastA100" class="w-full bg-warm border border-border rounded px-3 py-2 text-sm text-heading mb-3 focus:outline-none focus:border-accent">
         <label class="text-[11px] text-body block mb-1">Amount ($)</label>
         <input id="escrow-amount" type="text" placeholder="3.30" class="w-full bg-warm border border-border rounded px-3 py-2 text-sm text-heading mb-4 focus:outline-none focus:border-accent">
-        <button onclick="fundEscrow()" class="w-full bg-warm border border-accent text-accent font-semibold text-sm py-2 rounded hover:bg-accent hover:text-bg transition-colors">Fund Escrow</button>
+        <button onclick="fundEscrow()" id="fund-escrow-btn" class="w-full bg-warm border border-accent text-accent font-semibold text-sm py-2 rounded hover:bg-accent hover:text-bg transition-colors">Fund Escrow</button>
       </div>
 
       <div class="bg-panel border border-border rounded-lg p-5">
@@ -181,7 +183,7 @@ tailwind.config = {
         <input id="resolve-job-id" type="text" placeholder="job-001" class="w-full bg-warm border border-border rounded px-3 py-2 text-sm text-heading mb-3 focus:outline-none focus:border-accent">
         <label class="text-[11px] text-body block mb-1">Evidence (logs / output hash)</label>
         <textarea id="resolve-evidence" rows="3" placeholder='{"log_summary":"completed in 2h51m","output_hash":"0xdeadbeef"}' class="w-full bg-warm border border-border rounded px-3 py-2 text-xs font-mono text-heading mb-4 focus:outline-none focus:border-accent"></textarea>
-        <button onclick="resolveCompletion()" class="w-full bg-warm border border-accent text-accent font-semibold text-sm py-2 rounded hover:bg-accent hover:text-bg transition-colors">Resolve</button>
+        <button onclick="resolveCompletion()" id="resolve-btn" class="w-full bg-warm border border-accent text-accent font-semibold text-sm py-2 rounded hover:bg-accent hover:text-bg transition-colors">Resolve</button>
         <div id="escrow-result" class="mt-4 text-xs"></div>
       </div>
     </div>
@@ -207,6 +209,24 @@ tailwind.config = {
   </div>
 </div>
 
+<!-- Wallet Connect Modal -->
+<div id="wallet-modal" class="hidden fixed inset-0 bg-black/60 flex items-center justify-center z-50" onclick="if(event.target===this) closeWalletModal()">
+  <div class="bg-panel border border-border rounded-lg p-5 max-w-sm w-full mx-4">
+    <div class="flex items-center justify-between mb-3">
+      <h3 class="text-heading font-semibold text-sm">Connect a Wallet</h3>
+      <button onclick="closeWalletModal()" class="text-body hover:text-heading text-sm">✕</button>
+    </div>
+    <div id="wallet-list" class="space-y-2 max-h-72 overflow-y-auto">
+      <p class="text-xs text-body opacity-50">Detecting installed wallets...</p>
+    </div>
+    <p id="wallet-connected-info" class="hidden mt-3 pt-3 border-t border-border text-xs text-body">
+      Connected: <span id="wallet-connected-addr" class="font-mono text-heading"></span>
+      <button onclick="disconnectWallet()" class="ml-2 text-coral hover:underline">Disconnect</button>
+    </p>
+    <p class="text-[10px] text-body opacity-60 mt-3">Any EIP-1193 browser wallet works (MetaMask, Rabby, Coinbase Wallet, Brave, OKX, Rainbow, Trust Wallet, etc). Mobile wallet users: open this page from your wallet's built-in browser.</p>
+  </div>
+</div>
+
 <!-- Footer -->
 <footer class="border-t border-border px-6 py-3 mt-4">
   <div class="max-w-7xl mx-auto flex justify-between text-[10px] text-body opacity-50">
@@ -216,38 +236,42 @@ tailwind.config = {
 </footer>
 
 <script type="module">
-import { createClient, createAccount, generatePrivateKey } from 'https://esm.sh/genlayer-js@0.23.1';
+import { createClient } from 'https://esm.sh/genlayer-js@0.23.1';
 import { studionet, testnetBradbury } from 'https://esm.sh/genlayer-js@0.23.1/chains';
 
 // ─── Network Config ─────────────────────────────────────────────────────
 // Fill these in after running deploy/deploy-compute-bradbury.mjs and
 // deploy/deploy-compute-studionet.mjs (see deploy scripts' printed output).
+// 'studio' below is GenLayer Studio (studio.genlayer.com), which genlayer-js
+// exposes as the `studionet` chain / SDK network key.
 const NETWORKS = {
-  studionet: {
+  studio: {
     chain: studionet,
-    name: 'Studionet',
+    sdkKey: 'studionet',
+    name: 'GenLayer Studio',
     router: window.COMPUTE_CONFIG?.STUDIONET_ROUTER_ADDR || '',
     explorer: null,
   },
   bradbury: {
     chain: testnetBradbury,
+    sdkKey: 'testnetBradbury',
     name: 'Bradbury Testnet',
     router: window.COMPUTE_CONFIG?.BRADBURY_ROUTER_ADDR || '',
     explorer: 'https://explorer-bradbury.genlayer.com',
   },
 };
 
-// Deployer key for Bradbury demo (funded account — hackathon testnet only,
-// set via config.js; never commit a real key)
-const BRADBURY_DEPLOYER_KEY = window.COMPUTE_CONFIG?.BRADBURY_DEPLOYER_KEY || '';
-
 let currentNetwork = 'bradbury';
-let client;
+let readClient;                 // no wallet needed — used for all reads
+let writeClient = null;         // built once a wallet is connected
+let walletProvider = null;      // the EIP-1193 provider object the user picked
+let walletAddress = null;
 let providerData = {};
 
 function net() { return NETWORKS[currentNetwork]; }
 function explorerTxUrl(hash) { return net().explorer ? `${net().explorer}/txs/${hash}` : null; }
 function explorerAddrUrl(addr) { return net().explorer ? `${net().explorer}/address/${addr}` : null; }
+function shortAddr(a) { return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : ''; }
 
 // ─── Tabs ───────────────────────────────────────────────────────────────
 window.switchTab = function(tab) {
@@ -257,39 +281,165 @@ window.switchTab = function(tab) {
   if (tab === 'history') loadHistory();
 };
 
-// ─── Network Switching ──────────────────────────────────────────────────
-window.switchNetwork = async function() {
-  const sel = document.getElementById('network-select');
-  currentNetwork = sel.value;
-  await connectAndLoad();
+// ─── Wallet discovery (EIP-6963) ────────────────────────────────────────
+// This picks up every installed EVM wallet extension (MetaMask, Rabby,
+// Coinbase Wallet, Brave, OKX, Rainbow, Trust Wallet, etc.) without hard
+// -coding any single one of them.
+const discoveredWallets = new Map(); // uuid -> { info, provider }
+window.addEventListener('eip6963:announceProvider', (event) => {
+  discoveredWallets.set(event.detail.info.uuid, event.detail);
+  if (!document.getElementById('wallet-modal').classList.contains('hidden')) renderWalletList();
+});
+window.dispatchEvent(new Event('eip6963:requestProvider'));
+
+function renderWalletList() {
+  const list = document.getElementById('wallet-list');
+  const entries = Array.from(discoveredWallets.values());
+  const hasLegacyInjected = !!window.ethereum && entries.length === 0;
+
+  if (entries.length === 0 && !hasLegacyInjected) {
+    list.innerHTML = `<p class="text-xs text-body opacity-70">No browser wallet detected. Install MetaMask, Rabby, Coinbase Wallet, or another EVM wallet extension, then reload this page.</p>`;
+    return;
+  }
+
+  let html = entries.map(({ info }) => `
+    <button onclick="connectWallet('${info.uuid}')" class="w-full flex items-center gap-3 px-3 py-2 bg-warm border border-border rounded hover:border-accent transition-colors text-left">
+      <img src="${info.icon}" class="w-6 h-6 rounded" alt=""/>
+      <span class="text-sm text-heading">${info.name}</span>
+    </button>
+  `).join('');
+
+  if (hasLegacyInjected) {
+    html += `
+      <button onclick="connectWallet('legacy')" class="w-full flex items-center gap-3 px-3 py-2 bg-warm border border-border rounded hover:border-accent transition-colors text-left">
+        <span class="text-sm text-heading">Browser Wallet</span>
+      </button>
+    `;
+  }
+  list.innerHTML = html;
+}
+
+window.openWalletModal = function() {
+  document.getElementById('wallet-modal').classList.remove('hidden');
+  renderWalletList();
+  const info = document.getElementById('wallet-connected-info');
+  info.classList.toggle('hidden', !walletAddress);
+  if (walletAddress) document.getElementById('wallet-connected-addr').textContent = shortAddr(walletAddress);
+};
+window.closeWalletModal = function() {
+  document.getElementById('wallet-modal').classList.add('hidden');
 };
 
-async function connectAndLoad() {
+window.connectWallet = async function(uuid) {
+  const entry = discoveredWallets.get(uuid);
+  const provider = entry ? entry.provider : window.ethereum;
+  if (!provider) { alert('No wallet provider found.'); return; }
+
   const badge = document.getElementById('status-badge');
   badge.textContent = 'Connecting';
   badge.className = 'px-2.5 py-1 rounded-full text-[10px] font-medium bg-warm text-body';
   try {
-    const pk = currentNetwork === 'bradbury' && BRADBURY_DEPLOYER_KEY ? BRADBURY_DEPLOYER_KEY : generatePrivateKey();
-    const account = createAccount(pk);
-    client = createClient({ chain: net().chain, account });
-    badge.textContent = net().name;
-    badge.className = 'px-2.5 py-1 rounded-full text-[10px] font-medium bg-accent-dim text-bg';
-    await loadProviderData();
+    const accounts = await provider.request({ method: 'eth_requestAccounts' });
+    if (!accounts || accounts.length === 0) throw new Error('No account returned by wallet.');
+
+    walletProvider = provider;
+    walletAddress = accounts[0];
+
+    provider.removeListener?.('accountsChanged', handleAccountsChanged);
+    provider.removeListener?.('chainChanged', handleChainChanged);
+    provider.on?.('accountsChanged', handleAccountsChanged);
+    provider.on?.('chainChanged', handleChainChanged);
+
+    await buildWriteClient();
+    closeWalletModal();
+    updateWalletUI();
   } catch (e) {
-    console.error('Connect failed:', e);
-    badge.textContent = 'Error';
-    badge.className = 'px-2.5 py-1 rounded-full text-[10px] font-medium bg-coral text-white';
+    console.error('Wallet connect failed:', e);
+    alert(`Wallet connection failed: ${e.message || e}`);
+    badge.textContent = 'Read-only';
+    badge.className = 'px-2.5 py-1 rounded-full text-[10px] font-medium bg-warm text-body';
   }
+};
+
+window.disconnectWallet = function() {
+  if (walletProvider) {
+    walletProvider.removeListener?.('accountsChanged', handleAccountsChanged);
+    walletProvider.removeListener?.('chainChanged', handleChainChanged);
+  }
+  walletProvider = null;
+  walletAddress = null;
+  writeClient = null;
+  updateWalletUI();
+  closeWalletModal();
+};
+
+function handleAccountsChanged(accounts) {
+  if (!accounts || accounts.length === 0) { window.disconnectWallet(); return; }
+  walletAddress = accounts[0];
+  buildWriteClient();
+  updateWalletUI();
+}
+function handleChainChanged() {
+  // Rebuild the write client against whatever chain the wallet is now on
+  // is unnecessary — the SDK checks the wallet's chain against net().chain
+  // on every writeContract call and throws a clear error if they mismatch.
+  buildWriteClient();
+}
+
+async function buildWriteClient() {
+  if (!walletProvider || !walletAddress) return;
+  writeClient = createClient({
+    chain: net().chain,
+    account: walletAddress,
+    provider: walletProvider,
+  });
+  // Ask the wallet to switch to (or add) the right GenLayer network.
+  try { await writeClient.connect(net().sdkKey); } catch (e) { console.warn('Network switch prompt failed/skipped:', e.message); }
+}
+
+function updateWalletUI() {
+  const badge = document.getElementById('status-badge');
+  const btn = document.getElementById('wallet-btn');
+  if (walletAddress) {
+    badge.textContent = `${net().name} · ${shortAddr(walletAddress)}`;
+    badge.className = 'px-2.5 py-1 rounded-full text-[10px] font-medium bg-accent-dim text-bg';
+    btn.textContent = 'Wallet Connected';
+  } else {
+    badge.textContent = 'Read-only';
+    badge.className = 'px-2.5 py-1 rounded-full text-[10px] font-medium bg-warm text-body';
+    btn.textContent = 'Connect Wallet';
+  }
+  const disabled = !walletAddress;
+  ['route-btn', 'fund-escrow-btn', 'resolve-btn'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = disabled;
+  });
+}
+
+// ─── Network Switching ──────────────────────────────────────────────────
+window.switchNetwork = async function() {
+  const sel = document.getElementById('network-select');
+  currentNetwork = sel.value;
+  readClient = createClient({ chain: net().chain });
+  if (walletAddress) await buildWriteClient();
+  updateWalletUI();
+  await loadProviderData();
+};
+
+async function connectAndLoad() {
+  readClient = createClient({ chain: net().chain });
+  updateWalletUI();
+  await loadProviderData();
 }
 
 // ─── Provider data ──────────────────────────────────────────────────────
 async function loadProviderData() {
-  if (!client || !net().router) {
+  if (!readClient || !net().router) {
     renderProviderCards({});
     return;
   }
   try {
-    const raw = await client.readContract({ address: net().router, functionName: 'get_providers', args: [] });
+    const raw = await readClient.readContract({ address: net().router, functionName: 'get_providers', args: [] });
     providerData = JSON.parse(raw);
     renderProviderCards(providerData);
   } catch (e) {
@@ -352,8 +502,12 @@ async function loadProvidersTable() {
 
 // ─── Route a job ────────────────────────────────────────────────────────
 window.routeJob = async function() {
-  if (!client || !net().router) {
-    alert('Router not configured for this network yet. Run the deploy script and update frontend/config.js.');
+  if (!walletAddress || !writeClient) {
+    openWalletModal();
+    return;
+  }
+  if (!net().router) {
+    alert('Router not configured for this network yet. Run the deploy script and update frontend/compute-config.js.');
     return;
   }
   const vram = parseInt(document.getElementById('vram-input').value) || 24;
@@ -367,7 +521,7 @@ window.routeJob = async function() {
   document.getElementById('route-btn').disabled = true;
 
   try {
-    const txHash = await client.writeContract({
+    const txHash = await writeClient.writeContract({
       address: net().router,
       functionName: 'route_job',
       args: [
@@ -376,7 +530,7 @@ window.routeJob = async function() {
       ],
       value: BigInt(0),
     });
-    const receipt = await client.waitForTransactionReceipt({ hash: txHash, retries: 60, interval: 5000 });
+    const receipt = await writeClient.waitForTransactionReceipt({ hash: txHash, retries: 60, interval: 5000 });
     const resultRaw = receipt.data || receipt.result;
     const result = typeof resultRaw === 'string' ? JSON.parse(resultRaw) : resultRaw;
 
@@ -398,26 +552,27 @@ window.routeJob = async function() {
       <p class="text-[10px] text-body mt-1">This is normal on Bradbury testnet. Try again — consensus often succeeds on retry.</p>
       <button onclick="routeJob()" class="mt-2 px-3 py-1 text-xs bg-accent text-bg rounded hover:opacity-90">Retry</button>
     `;
-    document.getElementById('route-btn').disabled = false;
+    document.getElementById('route-btn').disabled = !walletAddress;
     return;
   }
   document.getElementById('route-loading').classList.add('hidden');
-  document.getElementById('route-btn').disabled = false;
+  document.getElementById('route-btn').disabled = !walletAddress;
 };
 
 // ─── Escrow ─────────────────────────────────────────────────────────────
 window.fundEscrow = async function() {
-  if (!client || !net().router) { alert('Router not configured.'); return; }
+  if (!walletAddress || !writeClient) { openWalletModal(); return; }
+  if (!net().router) { alert('Router not configured.'); return; }
   const jobId = document.getElementById('escrow-job-id').value.trim();
   const providerId = document.getElementById('escrow-provider-id').value.trim();
   const amount = document.getElementById('escrow-amount').value.trim();
   if (!jobId || !providerId || !amount) { alert('Fill in all escrow fields.'); return; }
 
   try {
-    const tx = await client.writeContract({
+    const tx = await writeClient.writeContract({
       address: net().router, functionName: 'fund_escrow', args: [jobId, providerId, amount], value: BigInt(0),
     });
-    await client.waitForTransactionReceipt({ hash: tx, retries: 60, interval: 5000 });
+    await writeClient.waitForTransactionReceipt({ hash: tx, retries: 60, interval: 5000 });
     document.getElementById('escrow-result').innerHTML = `<p class="text-accent">Escrow locked for ${jobId}.</p>`;
   } catch (e) {
     console.error(e);
@@ -426,17 +581,18 @@ window.fundEscrow = async function() {
 };
 
 window.resolveCompletion = async function() {
-  if (!client || !net().router) { alert('Router not configured.'); return; }
+  if (!walletAddress || !writeClient) { openWalletModal(); return; }
+  if (!net().router) { alert('Router not configured.'); return; }
   const jobId = document.getElementById('resolve-job-id').value.trim();
   const evidence = document.getElementById('resolve-evidence').value.trim() || '{}';
   if (!jobId) { alert('Enter a job ID.'); return; }
 
   document.getElementById('escrow-result').innerHTML = `<p class="text-body loading-dots">Resolving through validator consensus</p>`;
   try {
-    const tx = await client.writeContract({
+    const tx = await writeClient.writeContract({
       address: net().router, functionName: 'resolve_completion', args: [jobId, evidence], value: BigInt(0),
     });
-    const receipt = await client.waitForTransactionReceipt({ hash: tx, retries: 60, interval: 5000 });
+    const receipt = await writeClient.waitForTransactionReceipt({ hash: tx, retries: 60, interval: 5000 });
     const resultRaw = receipt.data || receipt.result;
     const result = typeof resultRaw === 'string' ? JSON.parse(resultRaw) : resultRaw;
     const color = result.status === 'released' ? 'text-accent' : 'text-coral';
@@ -453,12 +609,12 @@ window.resolveCompletion = async function() {
 // ─── History ────────────────────────────────────────────────────────────
 async function loadHistory() {
   const container = document.getElementById('history-list');
-  if (!client || !net().router) {
+  if (!readClient || !net().router) {
     container.innerHTML = '<p class="text-xs text-body opacity-50">Router not configured.</p>';
     return;
   }
   try {
-    const raw = await client.readContract({ address: net().router, functionName: 'get_job_history', args: [] });
+    const raw = await readClient.readContract({ address: net().router, functionName: 'get_job_history', args: [] });
     const history = JSON.parse(raw);
     if (history.length === 0) {
       container.innerHTML = '<p class="text-xs text-body opacity-50">No jobs routed yet.</p>';
