@@ -279,6 +279,20 @@ function shortAddr(a) { return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : ''; }
 // checks every plausible location instead of assuming one. Returns
 // { parsed, raw } — parsed is the decoded object (or null if not found),
 // raw is always the full receipt for on-screen debugging as a fallback.
+//
+// IMPORTANT: on Bradbury, what shows up in these receipt fields (and in
+// GenExplorer's "Output Data / Return Value") is often the *nondet
+// (equivalence) block's raw output* — i.e. the leader LLM's dict, taken
+// straight from the tx's eqBlocksOutputs — NOT the plain `json.dumps(...)`
+// string our `route_job`/`resolve_completion` functions actually return.
+// That field is GenVM calldata (length-prefixed, binary), so length-prefix
+// bytes that happen to fall in the printable ASCII range show up as stray
+// punctuation like "\", "$", "(", "%%" around "provider" / "reasoning".
+// It is NOT reliably regex-parseable by position, only by keyword.
+// Because of that, callers should prefer reading the value back from the
+// contract's own view functions (get_job_history / get_escrow_status) —
+// see routeJob()/resolveCompletion() below — and only fall back to this
+// function (including its text-pattern branch) when that read fails too.
 function extractContractResult(receipt) {
   const candidates = [
     receipt?.data,
@@ -300,6 +314,23 @@ function extractContractResult(receipt) {
     } else if (c && typeof c === 'object' && ('provider' in c || 'status' in c || 'completed' in c)) {
       return { parsed: c, raw: receipt };
     }
+  }
+  // Last resort: scan the whole receipt (stringified) for the
+  // "provider<junk>NAME ... reasoning ... text" pattern that GenVM's raw
+  // calldata dump produces when a real JSON string can't be found anywhere
+  // above. The separator byte right after "provider"/"reasoning" is not a
+  // stable delimiter (it's a length-prefix byte, not punctuation), so we
+  // only anchor on the keywords themselves and strip whatever non-letter
+  // junk sits between them.
+  const blob = JSON.stringify(receipt, (k, v) => typeof v === 'bigint' ? v.toString() : v);
+  const m = blob.match(/provider[^A-Za-z0-9]{0,2}([A-Za-z0-9_.-]+)[\s\S]{0,20}?reasoning[^A-Za-z0-9]{0,4}([\s\S]*?)(?:\\"|"\s*[,}]|$)/i);
+  if (m) {
+    const reasoning = m[2]
+      .replace(/\\n/g, ' ')
+      .replace(/[^\x20-\x7E]+/g, ' ')   // drop stray control/binary bytes
+      .replace(/\s+padded\s*$/i, '')
+      .trim();
+    return { parsed: { provider: m[1], reasoning }, raw: receipt };
   }
   return { parsed: null, raw: receipt };
 }
@@ -562,7 +593,27 @@ window.routeJob = async function() {
       value: BigInt(0),
     });
     const receipt = await writeClient.waitForTransactionReceipt({ hash: txHash, status: 'ACCEPTED', retries: 60, interval: 5000 });
-    const { parsed: result, raw } = extractContractResult(receipt);
+
+    // Prefer reading the result back from the contract's own view function.
+    // get_job_history() returns a plain json.dumps(...) string with no LLM
+    // equivalence-block encoding involved, so it's the reliable source —
+    // the write receipt's "Return Value" is often the raw nondet leader
+    // output instead (see extractContractResult's comment above) and only
+    // gets used as a fallback if this read itself fails.
+    let result = null;
+    let raw = receipt;
+    try {
+      const historyRaw = await readClient.readContract({ address: net().router, functionName: 'get_job_history', args: [] });
+      const history = JSON.parse(historyRaw);
+      result = history[history.length - 1] || null;
+    } catch (e) {
+      console.warn('get_job_history readback failed, falling back to receipt parsing:', e);
+    }
+    if (!result) {
+      const extracted = extractContractResult(receipt);
+      result = extracted.parsed;
+      raw = extracted.raw;
+    }
 
     const debugEl = document.getElementById('route-debug');
     if (!result) {
@@ -634,7 +685,24 @@ window.resolveCompletion = async function() {
       address: net().router, functionName: 'resolve_completion', args: [jobId, evidence], value: BigInt(0),
     });
     const receipt = await writeClient.waitForTransactionReceipt({ hash: tx, status: 'ACCEPTED', retries: 60, interval: 5000 });
-    const { parsed: result, raw } = extractContractResult(receipt);
+
+    // Same reasoning as routeJob(): read the resolved escrow record back
+    // from the contract's own view function first, since that's plain
+    // JSON with no nondet-block encoding to fight with.
+    let result = null;
+    let raw = receipt;
+    try {
+      const escrowRaw = await readClient.readContract({ address: net().router, functionName: 'get_escrow_status', args: [jobId] });
+      const parsedEscrow = JSON.parse(escrowRaw);
+      if (parsedEscrow && Object.keys(parsedEscrow).length > 0) result = parsedEscrow;
+    } catch (e) {
+      console.warn('get_escrow_status readback failed, falling back to receipt parsing:', e);
+    }
+    if (!result) {
+      const extracted = extractContractResult(receipt);
+      result = extracted.parsed;
+      raw = extracted.raw;
+    }
     if (!result) {
       document.getElementById('escrow-result').innerHTML = `
         <p class="text-coral">Couldn't auto-parse the response. Raw receipt below — please share this:</p>
