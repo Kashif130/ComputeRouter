@@ -70,6 +70,23 @@ Users set three priority sliders (0–10 each): **cost**, **speed**, **reliabili
 - Reliability score derived only from actual escrow outcomes, immune to self-reported claims
 - Provider id charset restricted (alphanumeric + underscore) to prevent injection into prompts
 
+## Frontend: Wallet + Networks
+
+The frontend connects with a real EVM wallet instead of a throwaway key —
+click **Connect Wallet** and pick any installed EIP-1193 wallet (MetaMask,
+Rabby, Coinbase Wallet, Brave, OKX, Rainbow, Trust Wallet, etc.); discovery
+uses [EIP-6963](https://eips.ethereum.org/EIPS/eip-6963) so it isn't tied to
+any single wallet. The connected wallet signs `route_job`, `fund_escrow`, and
+`resolve_completion`; reads (providers, history) work without a wallet
+connected.
+
+The network dropdown switches between:
+- **Bradbury Testnet** (`testnetBradbury`)
+- **GenLayer Studio** (`studionet` — the hosted sandbox at studio.genlayer.com)
+
+Switching networks or connecting a wallet calls `client.connect(...)` to
+prompt the wallet to add/switch to the right chain automatically.
+
 ## Run Locally
 
 ```bash
@@ -79,17 +96,26 @@ pip install genlayer-test
 # Deploy the testnet-friendly router to Bradbury (needs funded account)
 DEPLOYER_KEY=0x... node deploy/deploy-compute-bradbury.mjs
 
-# Or deploy the full cross-contract version to studionet
+# Or deploy the full cross-contract version to GenLayer Studio (studionet)
 node deploy/deploy-compute-studionet.mjs
 
 # Run tests
 pytest tests/test_compute_router.py tests/test_provider_oracle.py -v
 
-# Open frontend
+# Open frontend locally
 cp frontend/compute-config.example.js frontend/compute-config.js
-# edit frontend/compute-config.js with your deployed router address
+# edit frontend/compute-config.js with your deployed router addresses
 open frontend/compute-index.html
 ```
+
+## Deploying to Vercel
+
+On Vercel, router addresses are managed as Environment Variables
+(`BRADBURY_ROUTER_ADDR`, `STUDIONET_ROUTER_ADDR`) rather than hand-edited in
+a file — a small build step (`frontend/generate-config.mjs`) writes them into
+`compute-config.js` at deploy time, so switching networks in the UI always
+reads the right contract address. See [VERCEL_DEPLOY.md](./VERCEL_DEPLOY.md)
+for the full walkthrough.
 
 ## What We Learned (carried over from WindfallRouter, still true here)
 
