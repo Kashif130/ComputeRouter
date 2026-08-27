@@ -360,11 +360,11 @@ function extractContractResult(receipt) {
 // the counter by exactly 1 per call and never skips or reorders ids.
 async function deriveLatestJobId() {
   try {
-    const raw = await readClient.readContract({ address: net().router, functionName: net().getCountFn, args: [] });
+    const raw = await readContractWithRetry(net().router, net().getCountFn, []);
     const count = Number(raw);
     if (count > 0) return `job-${count - 1}`;
   } catch (e) {
-    console.warn('job_id derivation via counter failed:', e);
+    console.warn('job_id derivation via counter failed after retries:', e);
   }
   return null;
 }
@@ -638,11 +638,11 @@ window.routeJob = async function() {
     let result = null;
     let raw = receipt;
     try {
-      const historyRaw = await readClient.readContract({ address: net().router, functionName: net().getHistoryFn, args: [] });
+      const historyRaw = await readContractWithRetry(net().router, net().getHistoryFn, []);
       const history = JSON.parse(historyRaw);
       result = history[history.length - 1] || null;
     } catch (e) {
-      console.warn(`${net().getHistoryFn} readback failed, falling back to receipt parsing:`, e);
+      console.warn(`${net().getHistoryFn} readback failed after retries, falling back to receipt parsing:`, e);
     }
     if (!result) {
       const extracted = extractContractResult(receipt);
@@ -738,6 +738,28 @@ window.fundEscrow = async function() {
   }
 };
 
+// Small helper: the contract's write already succeeded on-chain by the
+// time we get here (waitForTransactionReceipt already confirmed it) — a
+// view-function readback failing right after that is almost always the
+// read RPC node lagging slightly behind the just-mined tx, not a real
+// error. Retry a few times with a short delay before giving up, instead
+// of immediately falling back to the much less reliable raw-calldata
+// scrape (which can't recover fields like job_id/status at all when the
+// nondet block's own output turns out to be empty "padded" filler bytes
+// rather than real content).
+async function readContractWithRetry(address, functionName, args, retries = 4, delayMs = 1500) {
+  let lastErr;
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await readClient.readContract({ address, functionName, args });
+    } catch (e) {
+      lastErr = e;
+      if (i < retries - 1) await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
 window.resolveCompletion = async function() {
   if (!walletAddress || !writeClient) { openWalletModal(); return; }
   if (!net().router) { alert('Router not configured.'); return; }
@@ -754,15 +776,18 @@ window.resolveCompletion = async function() {
 
     // Same reasoning as routeJob(): read the resolved escrow record back
     // from the contract's own view function first, since that's plain
-    // JSON with no nondet-block encoding to fight with.
+    // JSON with no nondet-block encoding to fight with. Retried a few
+    // times first — see readContractWithRetry — because the tx is
+    // already ACCEPTED at this point, so a failed read here is a lagging
+    // node, not a real absence of data.
     let result = null;
     let raw = receipt;
     try {
-      const escrowRaw = await readClient.readContract({ address: net().router, functionName: 'get_escrow_status', args: [jobId] });
+      const escrowRaw = await readContractWithRetry(net().router, 'get_escrow_status', [jobId]);
       const parsedEscrow = JSON.parse(escrowRaw);
       if (parsedEscrow && Object.keys(parsedEscrow).length > 0) result = parsedEscrow;
     } catch (e) {
-      console.warn('get_escrow_status readback failed, falling back to receipt parsing:', e);
+      console.warn('get_escrow_status readback failed after retries, falling back to receipt parsing:', e);
     }
     if (!result) {
       const extracted = extractContractResult(receipt);
@@ -771,8 +796,9 @@ window.resolveCompletion = async function() {
     }
     if (!result) {
       document.getElementById('escrow-result').innerHTML = `
-        <p class="text-coral">Couldn't auto-parse the response. Raw receipt below — please share this:</p>
-        <pre class="mt-2 text-[10px] font-mono whitespace-pre-wrap break-all max-h-64 overflow-y-auto">${JSON.stringify(raw, (k, v) => typeof v === 'bigint' ? v.toString() : v, 2)}</pre>
+        <p class="text-coral">Transaction was accepted on-chain, but the result couldn't be read back yet.</p>
+        <button onclick="document.getElementById('resolve-job-id').value='${jobId}'; recheckEscrowStatus('${jobId}');" class="mt-2 px-3 py-1 text-xs bg-accent text-bg rounded hover:opacity-90">Check status again</button>
+        <pre class="hidden mt-2 text-[10px] font-mono whitespace-pre-wrap break-all max-h-64 overflow-y-auto">${JSON.stringify(raw, (k, v) => typeof v === 'bigint' ? v.toString() : v, 2)}</pre>
       `;
       return;
     }
@@ -786,6 +812,30 @@ window.resolveCompletion = async function() {
     document.getElementById('escrow-result').innerHTML = `<p class="text-coral">Failed: ${e.message}</p>`;
   }
 };
+
+// Manual re-check for the "accepted but couldn't read back yet" case —
+// just re-runs the same retried view-function read on demand, without
+// resubmitting a transaction.
+window.recheckEscrowStatus = async function(jobId) {
+  if (!net().router) return;
+  document.getElementById('escrow-result').innerHTML = `<p class="text-body loading-dots">Checking status</p>`;
+  try {
+    const escrowRaw = await readContractWithRetry(net().router, 'get_escrow_status', [jobId], 3, 1500);
+    const result = JSON.parse(escrowRaw);
+    if (!result || Object.keys(result).length === 0) throw new Error('empty result');
+    const color = result.status === 'released' ? 'text-accent' : 'text-coral';
+    document.getElementById('escrow-result').innerHTML = `
+      <p class="${color} font-semibold">Status: ${result.status}</p>
+      <p class="text-body mt-1 italic">${result.verdict_reasoning || ''}</p>
+    `;
+  } catch (e) {
+    document.getElementById('escrow-result').innerHTML = `
+      <p class="text-coral">Still couldn't read the status — try again in a few seconds.</p>
+      <button onclick="recheckEscrowStatus('${jobId}')" class="mt-2 px-3 py-1 text-xs bg-accent text-bg rounded hover:opacity-90">Check status again</button>
+    `;
+  }
+};
+
 
 // ─── History ────────────────────────────────────────────────────────────
 async function loadHistory() {
