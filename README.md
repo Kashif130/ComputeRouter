@@ -26,10 +26,16 @@ ComputeRouter (Intelligent Contract)
 Job runs off-chain on the chosen provider
   |
   v
-fund_escrow() locks payment  →  resolve_completion() submits evidence
+fund_escrow() locks REAL GEN (payable) bound to that job_id + provider
+  |-- [DETERMINISTIC] Rejects any job_id/provider_id route_job didn't actually produce
+  |-- [DETERMINISTIC] Amount = gl.message.value — not a number the caller can just claim
+  |
+  v
+resolve_completion() submits evidence
   |-- [NONDET] Leader LLM judges: did the provider defensibly complete the job?
   |-- [CONSENSUS] Validators independently verify the verdict
-  |-- [DETERMINISTIC] Escrow releases or moves to disputed
+  |-- [DETERMINISTIC] Only runs once per job (status must still be "locked") — no replay
+  |-- [DETERMINISTIC] emit_transfer() pays the provider on release, or refunds the depositor
 ```
 
 ### Why the Hard/Soft Split Matters
@@ -50,25 +56,36 @@ WindfallRouter (the sibling project this pattern is drawn from) left every decis
 
 Users set three priority sliders (0–10 each): **cost**, **speed**, **reliability**. Different sliders produce different routing decisions for the same job — all verified by consensus, not by trusting a single broker.
 
+### Escrow Is Real, Bound, and Non-Replayable
+
+`fund_escrow` is `@gl.public.write.payable`: the escrowed amount is whatever GEN the caller actually attaches (`gl.message.value`), not a string parameter they could set to anything. It also checks the `job_id`/`provider_id` pair against `routed_jobs`, the record `route_job` itself wrote — so escrow can only ever be opened for a job that was genuinely routed to that provider.
+
+`resolve_completion` only proceeds if the escrow's status is still `"locked"`; it flips to a terminal status (`"released"`/`"refunded"`) *before* calling `emit_transfer()`, so the same job can never be resolved — and never paid out — twice. Only the depositor or the provider's registered payout address may call it.
+
 ### Reliability Is Earned, Not Claimed
 
-`ProviderOracle.get_reliability()` is computed from real escrow history (`completions` vs `disputes`), not from a self-reported field in a provider's registration payload. A provider claiming 99.9% reliability in their own data gets ignored — the score comes from `resolve_completion()` outcomes.
+`ProviderOracle.get_reliability()` is computed from real escrow history (`completions` vs `disputes`), not from a self-reported field in a provider's registration payload. A provider claiming 99.9% reliability in their own data gets ignored — the score comes from `resolve_completion()` outcomes, relayed automatically by `ComputeRouterFull`.
 
 ## Contracts
 
 | Contract | Purpose | Equivalence Principle |
 |----------|---------|----------------------|
-| `compute_router.py` | Testnet-friendly router with a built-in provider registry, escrow, and dispute resolution | Non-Comparative (semantic defensibility — reliable under testnet load) |
-| `compute_router_full.py` | Mainnet-style router reading live data from `ProviderOracle` via cross-contract calls, with genuine validator re-reasoning | Non-Comparative (full LLM re-reasoning per validator) |
-| `provider_oracle.py` | Provider registry + live marketplace pricing oracle + onchain reliability scoring | Comparative (5% tolerance on live price feeds) |
+| `compute_router.py` | Testnet-friendly router with a built-in provider registry, real payable escrow, and non-replayable settlement | Non-Comparative (semantic defensibility — reliable under testnet load) |
+| `compute_router_full.py` | Mainnet-style router reading live data + payout addresses from `ProviderOracle` via cross-contract calls, with genuine validator re-reasoning | Non-Comparative (full LLM re-reasoning per validator) |
+| `provider_oracle.py` | Provider registry + payout addresses + live marketplace pricing oracle + onchain reliability scoring | Comparative (5% tolerance on live price feeds) |
 
 ### Security
 
-- Owner-gated admin functions (`register_provider`, oracle address, pricing updates)
+- Self-service `register_provider`: the caller becomes that provider_id's payout address; a different address can't silently take over an existing id
 - Hard VRAM constraint enforced in Python, never left to LLM judgment
+- Escrow funds come from real attached value (`gl.message.value`), never a caller-supplied string
+- Escrow can only be opened for a job_id/provider_id pair `route_job` actually produced
+- Settlement is non-replayable: status flips to terminal *before* the transfer, and any further `resolve_completion` call on that job_id reverts
+- Only the depositor or the provider may trigger resolution of their own job
 - Input length limits on job specs, priorities, and evidence payloads
 - Reliability score derived only from actual escrow outcomes, immune to self-reported claims
 - Provider id charset restricted (alphanumeric + underscore) to prevent injection into prompts
+- `ComputeRouterFull`/`ProviderOracle` owner is set explicitly via `set_owner()` after deployment (constructor args aren't used for this), so owner-gated calls like `set_oracle()` can't be permanently locked out
 
 ## Frontend: Wallet + Networks
 
