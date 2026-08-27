@@ -3,6 +3,6 @@
   "outputDirectory": ".",
   "cleanUrls": true,
   "rewrites": [
-    { "source": "/", "destination": "/compute-index.html" }
+    { "source": "/", "destination": "/index.html" }
   ]
 }
