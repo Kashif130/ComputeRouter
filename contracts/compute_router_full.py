@@ -46,13 +46,13 @@ class ComputeRouterFull(gl.Contract):
     @gl.public.write
     def set_owner(self, expected_owner: Address):
         if self.owner == ZERO_ADDR:
-            assert gl.message.sender_account == expected_owner, "Sender must match expected owner"
+            assert gl.message.sender_address == expected_owner, "Sender must match expected owner"
             self.owner = expected_owner
         else:
-            assert gl.message.sender_account == self.owner, "Owner already set"
+            assert gl.message.sender_address == self.owner, "Owner already set"
 
     def _only_owner(self):
-        assert gl.message.sender_account == self.owner, "Only owner"
+        assert gl.message.sender_address == self.owner, "Only owner"
 
     @gl.public.write
     def set_oracle(self, oracle_addr: Address):
@@ -222,7 +222,7 @@ class ComputeRouterFull(gl.Contract):
 
         target = payout_addr if completed else depositor
         assert target != ZERO_ADDR, "no valid payout target on record"
-        gl.emit_transfer(target, amount)
+        gl.get_contract_at(target).emit_transfer(value=amount)
 
         # Best-effort relay to the oracle so reliability reflects real
         # outcomes. If this contract isn't the oracle's owner the relay
