@@ -102,20 +102,38 @@ async function main() {
   console.log(`  explorer: https://explorer-bradbury.genlayer.com/txs/${routeTx}`);
 
   const routeReceipt = await client.waitForTransactionReceipt({ hash: routeTx, retries: 120, interval: 5000 });
-  console.log('  Result:', JSON.stringify(routeReceipt.data || routeReceipt.result, null, 2));
+  const routeResult = routeReceipt.data || routeReceipt.result;
+  console.log('  Result:', JSON.stringify(routeResult, null, 2));
+  const routeParsed = typeof routeResult === 'string' ? JSON.parse(routeResult) : routeResult;
+  const routedJobId = routeParsed?.job_id;
+  const routedProvider = routeParsed?.provider;
 
-  // Step 5: Test escrow lifecycle
-  console.log('\nTest escrow lifecycle...');
-  await callWrite(routerAddr, 'fund_escrow', ['demo-job-1', 'runpodA6000', '2.37'], 'Fund escrow');
-  const resolveTx = await client.writeContract({
-    address: routerAddr,
-    functionName: 'resolve_completion',
-    args: ['demo-job-1', JSON.stringify({ log_summary: 'completed in 2h51m', output_hash: '0xdeadbeef' })],
-    value: BigInt(0),
-  });
-  console.log(`  resolve tx: ${resolveTx}`);
-  const resolveReceipt = await client.waitForTransactionReceipt({ hash: resolveTx, retries: 120, interval: 5000 });
-  console.log('  Escrow result:', JSON.stringify(resolveReceipt.data || resolveReceipt.result, null, 2));
+  // Step 5: Test escrow lifecycle — fund_escrow is payable now: the
+  // escrowed amount is whatever real GEN value is attached to the tx, and
+  // job_id/provider_id must match what route_job actually assigned above.
+  if (routedJobId && routedProvider) {
+    console.log('\nTest escrow lifecycle...');
+    const fundTx = await client.writeContract({
+      address: routerAddr,
+      functionName: 'fund_escrow',
+      args: [routedJobId, routedProvider],
+      value: BigInt(1000), // real GEN attached — this is what gets locked
+    });
+    await client.waitForTransactionReceipt({ hash: fundTx, retries: 120, interval: 5000 });
+    console.log(`  funded: ${fundTx}`);
+
+    const resolveTx = await client.writeContract({
+      address: routerAddr,
+      functionName: 'resolve_completion',
+      args: [routedJobId, JSON.stringify({ log_summary: 'completed in 2h51m', output_hash: '0xdeadbeef' })],
+      value: BigInt(0),
+    });
+    console.log(`  resolve tx: ${resolveTx}`);
+    const resolveReceipt = await client.waitForTransactionReceipt({ hash: resolveTx, retries: 120, interval: 5000 });
+    console.log('  Escrow result:', JSON.stringify(resolveReceipt.data || resolveReceipt.result, null, 2));
+  } else {
+    console.log('\nSkipping escrow test — routing did not return a job_id.');
+  }
 
   // Summary
   console.log('\n═══════════════════════════════════════════════════');
