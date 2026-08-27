@@ -33,12 +33,12 @@ class ProviderOracle(gl.Contract):
     @gl.public.write
     def set_owner(self):
         if self.owner == ZERO_ADDR:
-            self.owner = gl.message.sender_account
+            self.owner = gl.message.sender_address
         else:
-            assert gl.message.sender_account == self.owner, "Owner already set"
+            assert gl.message.sender_address == self.owner, "Owner already set"
 
     def _only_owner(self):
-        assert gl.message.sender_account == self.owner, "Only owner"
+        assert gl.message.sender_address == self.owner, "Only owner"
 
     @gl.public.write
     def register_provider(self, provider_id: str, provider_data_json: str, payout_address: Address):
