@@ -258,6 +258,7 @@ const NETWORKS = {
     // differently than the standalone testnet contract.
     getProvidersFn: 'get_all_providers',
     getHistoryFn: 'get_history',
+    getCountFn: 'get_history_count',
     providersOnOracle: true,
   },
   bradbury: {
@@ -271,6 +272,7 @@ const NETWORKS = {
     // provider registry and history getters under these names.
     getProvidersFn: 'get_providers',
     getHistoryFn: 'get_job_history',
+    getCountFn: 'get_job_count',
     providersOnOracle: false,
   },
 };
@@ -346,6 +348,25 @@ function extractContractResult(receipt) {
     return { parsed: { provider: m[1], reasoning }, raw: receipt };
   }
   return { parsed: null, raw: receipt };
+}
+
+// job_id is assigned from a plain, deterministic on-chain counter
+// (job_counter) — it never depends on any LLM/nondet output. So even when
+// the history readback AND the calldata-scraping fallback above both fail
+// to recover job_id (e.g. get_job_history() lagging behind the just-mined
+// tx on a slow read node), we can still recover the correct job_id on its
+// own by reading the counter view function directly: the job that was
+// just routed is always "job-" + (count - 1), since route_job increments
+// the counter by exactly 1 per call and never skips or reorders ids.
+async function deriveLatestJobId() {
+  try {
+    const raw = await readClient.readContract({ address: net().router, functionName: net().getCountFn, args: [] });
+    const count = Number(raw);
+    if (count > 0) return `job-${count - 1}`;
+  } catch (e) {
+    console.warn('job_id derivation via counter failed:', e);
+  }
+  return null;
 }
 
 // ─── Tabs ───────────────────────────────────────────────────────────────
@@ -627,6 +648,16 @@ window.routeJob = async function() {
       const extracted = extractContractResult(receipt);
       result = extracted.parsed;
       raw = extracted.raw;
+    }
+    // Belt-and-suspenders: whichever path produced `result` (or even if
+    // neither did), job_id specifically can always be recovered from the
+    // deterministic counter — don't let a parsing miss on provider/reasoning
+    // also silently cost us the job_id auto-fill into the Escrow tab.
+    if (!result || !result.job_id) {
+      const derivedJobId = await deriveLatestJobId();
+      if (derivedJobId) {
+        result = result ? { ...result, job_id: derivedJobId } : { job_id: derivedJobId };
+      }
     }
 
     const debugEl = document.getElementById('route-debug');
