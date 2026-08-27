@@ -249,7 +249,7 @@ class ComputeRouter(gl.Contract):
 
         target = payout_addr if completed else depositor
         assert target != ZERO_ADDR, "no valid payout target on record"
-        gl.emit_transfer(target, amount)
+        gl.get_contract_at(target).emit_transfer(value=amount)
 
         return json.dumps(record)
 
