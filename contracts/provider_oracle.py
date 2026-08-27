@@ -2,10 +2,14 @@
 from genlayer import *
 import json
 
+ZERO_ADDR = Address(b'\x00' * 20)
+
 
 class ProviderOracle(gl.Contract):
     """
-    Registry + live pricing oracle for decentralized GPU providers.
+    Registry + live pricing oracle for decentralized GPU providers, plus
+    each provider's payout address so ComputeRouterFull's escrow can
+    settle to a real wallet instead of a self-reported string.
 
     Owner-gated writes, capped provider count. Pulls live spot pricing from
     public GPU marketplace APIs (Vast.ai-style) so ComputeRouter always
@@ -19,6 +23,7 @@ class ProviderOracle(gl.Contract):
 
     owner: Address
     provider_registry: TreeMap[str, str]
+    provider_payout: TreeMap[str, Address]
     provider_ids: DynArray[str]
     completions: TreeMap[str, u32]
     disputes: TreeMap[str, u32]
@@ -27,7 +32,7 @@ class ProviderOracle(gl.Contract):
 
     @gl.public.write
     def set_owner(self):
-        if self.owner == Address(b'\x00' * 20):
+        if self.owner == ZERO_ADDR:
             self.owner = gl.message.sender_account
         else:
             assert gl.message.sender_account == self.owner, "Owner already set"
@@ -36,18 +41,20 @@ class ProviderOracle(gl.Contract):
         assert gl.message.sender_account == self.owner, "Only owner"
 
     @gl.public.write
-    def register_provider(self, provider_id: str, provider_data_json: str):
-        """Register or update a GPU provider. Owner only."""
+    def register_provider(self, provider_id: str, provider_data_json: str, payout_address: Address):
+        """Register or update a GPU provider and its payout wallet. Owner only."""
         self._only_owner()
         assert len(provider_id) < 16, "provider_id too long"
         assert all(c.isalnum() or c == '_' for c in provider_id), "provider_id must be alphanumeric"
         assert len(provider_data_json) < 4096, "provider data too large"
+        assert payout_address != ZERO_ADDR, "payout_address required"
         data = json.loads(provider_data_json)
         for field in ("gpu_type", "vram_gb", "cost_per_hr"):
             assert field in data, f"{field} required"
 
         is_new = self.provider_registry.get(provider_id, "") == ""
         self.provider_registry[provider_id] = provider_data_json
+        self.provider_payout[provider_id] = payout_address
         if is_new:
             assert len(self.provider_ids) < self.MAX_PROVIDERS, "provider cap reached"
             self.provider_ids.append(provider_id)
@@ -95,8 +102,9 @@ class ProviderOracle(gl.Contract):
     @gl.public.write
     def record_completion(self, provider_id: str, completed: bool):
         """
-        Called by ComputeRouter (or its owner-relay) after resolve_completion.
-        Feeds the reliability score — real track record, not self-reported.
+        Called by ComputeRouterFull (or its owner-relay) after
+        resolve_completion. Feeds the reliability score — real track
+        record, not self-reported.
         """
         self._only_owner()
         assert self.provider_registry.get(provider_id, "") != "", "Provider not registered"
@@ -114,6 +122,10 @@ class ProviderOracle(gl.Contract):
         if total == 0:
             return u32(100)  # no history yet — benefit of the doubt
         return u32(int((done / total) * 100))
+
+    @gl.public.view
+    def get_payout_address(self, provider_id: str) -> Address:
+        return self.provider_payout.get(provider_id, ZERO_ADDR)
 
     @gl.public.view
     def get_provider(self, provider_id: str) -> str:
