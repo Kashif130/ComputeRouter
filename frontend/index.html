@@ -251,14 +251,27 @@ const NETWORKS = {
     sdkKey: 'studionet',
     name: 'GenLayer Studio',
     router: window.COMPUTE_CONFIG?.STUDIONET_ROUTER_ADDR || '',
+    oracle: window.COMPUTE_CONFIG?.STUDIONET_ORACLE_ADDR || '',
     explorer: null,
+    // Studio runs ComputeRouterFull, whose provider list lives on
+    // ProviderOracle (not the router) and whose history getters are named
+    // differently than the standalone testnet contract.
+    getProvidersFn: 'get_all_providers',
+    getHistoryFn: 'get_history',
+    providersOnOracle: true,
   },
   bradbury: {
     chain: testnetBradbury,
     sdkKey: 'testnetBradbury',
     name: 'Bradbury Testnet',
     router: window.COMPUTE_CONFIG?.BRADBURY_ROUTER_ADDR || '',
+    oracle: '',
     explorer: 'https://explorer-bradbury.genlayer.com',
+    // Bradbury runs the standalone compute_router.py, which keeps its own
+    // provider registry and history getters under these names.
+    getProvidersFn: 'get_providers',
+    getHistoryFn: 'get_job_history',
+    providersOnOracle: false,
   },
 };
 
@@ -496,12 +509,13 @@ async function connectAndLoad() {
 
 // ─── Provider data ──────────────────────────────────────────────────────
 async function loadProviderData() {
-  if (!readClient || !net().router) {
+  const sourceAddr = net().providersOnOracle ? net().oracle : net().router;
+  if (!readClient || !sourceAddr) {
     renderProviderCards({});
     return;
   }
   try {
-    const raw = await readClient.readContract({ address: net().router, functionName: 'get_providers', args: [] });
+    const raw = await readClient.readContract({ address: sourceAddr, functionName: net().getProvidersFn, args: [] });
     providerData = JSON.parse(raw);
     renderProviderCards(providerData);
   } catch (e) {
@@ -603,11 +617,11 @@ window.routeJob = async function() {
     let result = null;
     let raw = receipt;
     try {
-      const historyRaw = await readClient.readContract({ address: net().router, functionName: 'get_job_history', args: [] });
+      const historyRaw = await readClient.readContract({ address: net().router, functionName: net().getHistoryFn, args: [] });
       const history = JSON.parse(historyRaw);
       result = history[history.length - 1] || null;
     } catch (e) {
-      console.warn('get_job_history readback failed, falling back to receipt parsing:', e);
+      console.warn(`${net().getHistoryFn} readback failed, falling back to receipt parsing:`, e);
     }
     if (!result) {
       const extracted = extractContractResult(receipt);
@@ -634,6 +648,15 @@ window.routeJob = async function() {
       document.querySelectorAll('.provider-card').forEach(c => c.classList.remove('chosen'));
       const chosenCard = document.getElementById(`pcard-${result.provider}`);
       if (chosenCard) chosenCard.classList.add('chosen');
+      // Escrow can only be funded for the job_id/provider_id that route_job
+      // actually assigned (the contract checks this on-chain too) — carry
+      // it forward automatically so the demo can't drift out of sync.
+      if (result.job_id) {
+        const jobIdEl = document.getElementById('escrow-job-id');
+        const providerIdEl = document.getElementById('escrow-provider-id');
+        if (jobIdEl) jobIdEl.value = result.job_id;
+        if (providerIdEl) providerIdEl.value = result.provider || '';
+      }
     }
 
     document.getElementById('route-result').classList.remove('hidden');
@@ -660,12 +683,24 @@ window.fundEscrow = async function() {
   const amount = document.getElementById('escrow-amount').value.trim();
   if (!jobId || !providerId || !amount) { alert('Fill in all escrow fields.'); return; }
 
+  // The dollar figure in the form becomes the REAL value attached to the
+  // transaction — the contract locks gl.message.value, not a string the
+  // caller could otherwise lie about. GEN uses 18 decimals like ETH.
+  let weiValue;
+  try {
+    weiValue = BigInt(Math.round(parseFloat(amount) * 1e18));
+    if (weiValue <= BigInt(0)) throw new Error('Amount must be greater than 0');
+  } catch (e) {
+    alert('Enter a valid positive amount.');
+    return;
+  }
+
   try {
     const tx = await writeClient.writeContract({
-      address: net().router, functionName: 'fund_escrow', args: [jobId, providerId, amount], value: BigInt(0),
+      address: net().router, functionName: 'fund_escrow', args: [jobId, providerId], value: weiValue,
     });
     await writeClient.waitForTransactionReceipt({ hash: tx, status: 'ACCEPTED', retries: 60, interval: 5000 });
-    document.getElementById('escrow-result').innerHTML = `<p class="text-accent">Escrow locked for ${jobId}.</p>`;
+    document.getElementById('escrow-result').innerHTML = `<p class="text-accent">Escrow locked for ${jobId} (${amount} GEN attached on-chain).</p>`;
   } catch (e) {
     console.error(e);
     document.getElementById('escrow-result').innerHTML = `<p class="text-coral">Failed: ${e.message}</p>`;
@@ -729,7 +764,7 @@ async function loadHistory() {
     return;
   }
   try {
-    const raw = await readClient.readContract({ address: net().router, functionName: 'get_job_history', args: [] });
+    const raw = await readClient.readContract({ address: net().router, functionName: net().getHistoryFn, args: [] });
     const history = JSON.parse(raw);
     if (history.length === 0) {
       container.innerHTML = '<p class="text-xs text-body opacity-50">No jobs routed yet.</p>';
