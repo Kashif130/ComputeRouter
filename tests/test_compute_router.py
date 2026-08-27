@@ -111,17 +111,37 @@ def test_route_job_rejects_out_of_set_provider(direct_vm, direct_deploy, direct_
 
 
 def test_escrow_lifecycle(direct_vm, direct_deploy, direct_alice):
-    """fund_escrow locks a job, resolve_completion releases or disputes it
-    based on independently-verified 'defensible completion' — the same
-    subjective-consensus primitive applied to payment release."""
+    """fund_escrow locks real value against a job route_job actually
+    produced; resolve_completion releases or refunds it based on
+    independently-verified 'defensible completion'. Full coverage of
+    funding/authorization/replay-protection edge cases lives in
+    tests/test_escrow_settlement.py — this is a smoke test of the happy
+    path end to end."""
     router = direct_deploy("contracts/compute_router.py")
     direct_vm.sender = direct_alice
     _register_providers(router)
 
-    router.fund_escrow("job-1", "vastA100", "1.10")
-    status = json.loads(router.get_escrow_status("job-1"))
-    assert status["status"] == "locked"
+    direct_vm.mock_llm(
+        r".*Pick the best GPU provider.*",
+        json.dumps({
+            "provider": "vastA100",
+            "reasoning": "Reliability is prioritized and this node has the shortest queue wait.",
+        }),
+    )
+    routed = json.loads(router.route_job(
+        json.dumps({"vram_needed_gb": 24, "est_hours": 2}),
+        json.dumps({"cost": 3, "speed": 4, "reliability": 9}),
+    ))
+    direct_vm.clear_mocks()
+    job_id, provider = routed["job_id"], routed["provider"]
 
+    direct_vm.value = 1100
+    router.fund_escrow(job_id, provider)
+    status = json.loads(router.get_escrow_status(job_id))
+    assert status["status"] == "locked"
+    assert status["amount"] == "1100"
+
+    direct_vm.value = 0
     direct_vm.mock_llm(
         r".*Did the provider defensibly complete.*",
         json.dumps({
@@ -130,21 +150,38 @@ def test_escrow_lifecycle(direct_vm, direct_deploy, direct_alice):
         }),
     )
     result = json.loads(router.resolve_completion(
-        "job-1",
+        job_id,
         json.dumps({"log_summary": "completed in 1h52m", "output_hash": "0xabc123"}),
     ))
     assert result["status"] == "released"
     direct_vm.clear_mocks()
 
 
-def test_escrow_dispute_path(direct_vm, direct_deploy, direct_alice):
-    """When evidence doesn't support completion, escrow moves to 'disputed'
-    instead of silently releasing funds."""
+def test_escrow_refund_path(direct_vm, direct_deploy, direct_alice):
+    """When evidence doesn't support completion, escrow moves to
+    'refunded' — money goes back to the depositor, not to the provider."""
     router = direct_deploy("contracts/compute_router.py")
     direct_vm.sender = direct_alice
     _register_providers(router)
 
-    router.fund_escrow("job-2", "ioT4", "0.19")
+    direct_vm.mock_llm(
+        r".*Pick the best GPU provider.*",
+        json.dumps({
+            "provider": "ioT4",
+            "reasoning": "Cost is the top priority and this is the cheapest option that fits.",
+        }),
+    )
+    routed = json.loads(router.route_job(
+        json.dumps({"vram_needed_gb": 8, "est_hours": 1}),
+        json.dumps({"cost": 9, "speed": 3, "reliability": 3}),
+    ))
+    direct_vm.clear_mocks()
+    job_id, provider = routed["job_id"], routed["provider"]
+
+    direct_vm.value = 190
+    router.fund_escrow(job_id, provider)
+
+    direct_vm.value = 0
     direct_vm.mock_llm(
         r".*Did the provider defensibly complete.*",
         json.dumps({
@@ -153,10 +190,10 @@ def test_escrow_dispute_path(direct_vm, direct_deploy, direct_alice):
         }),
     )
     result = json.loads(router.resolve_completion(
-        "job-2",
+        job_id,
         json.dumps({"log_summary": "no logs submitted"}),
     ))
-    assert result["status"] == "disputed"
+    assert result["status"] == "refunded"
     direct_vm.clear_mocks()
 
 
