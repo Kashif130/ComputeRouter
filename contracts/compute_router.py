@@ -2,6 +2,9 @@
 from genlayer import *
 import json
 
+ZERO_ADDR = Address(b'\x00' * 20)
+
+
 def parse_result(raw):
     """Handle both dict (response_format='json') and str (raw text) from exec_prompt."""
     if isinstance(raw, dict):
@@ -16,33 +19,50 @@ def parse_result(raw):
 
 class ComputeRouter(gl.Contract):
     """
-    Trustless GPU-job routing on GenLayer.
-
-    A job (training run, render, batch inference) needs a GPU provider.
-    Providers differ on cost/hr, GPU type/VRAM, current queue wait, and a
-    reliability score (historical completion rate). There is no formula
-    that cleanly resolves "cheap but flaky" vs "expensive but reliable" vs
-    "fast queue but wrong GPU tier" — it's a judgment call.
+    Trustless GPU-job routing on GenLayer, with a real escrow: funds are
+    received on-chain by the contract itself (@gl.public.write.payable),
+    bound to the specific job_id + provider that route_job actually
+    produced, and released or refunded on-chain via emit_transfer() only
+    after a single, non-replayable completion decision.
 
     Leader LLM proposes a provider + reasoning. Validators don't recompute
     the same score — they check whether the leader's pick is *defensible*
-    given the hard constraints (VRAM fits, GPU type supported) and the
-    stated priorities. That's the subjective consensus layer.
+    given the hard constraints (VRAM fits) and the stated priorities.
+    That's the subjective consensus layer, applied twice: once to route
+    the job, once to judge whether it was defensibly completed.
     """
 
     provider_registry: TreeMap[str, str]
+    provider_payout: TreeMap[str, Address]   # provider_id -> wallet that receives payment
     provider_id_list: str
     job_history: DynArray[str]
-    escrow: TreeMap[str, str]  # job_id -> {"provider":..,"amount":..,"status":..}
+    job_counter: u32
+
+    routed_jobs: TreeMap[str, str]           # job_id -> provider_id (set only by route_job)
+    escrow_meta: TreeMap[str, str]           # job_id -> {"provider","amount","status"}
+    escrow_depositor: TreeMap[str, Address]  # job_id -> who funded it (typed, not user-supplied)
 
     @gl.public.write
     def register_provider(self, provider_id: str, provider_data_json: str):
+        """
+        Self-service registration: the caller becomes the payout address
+        for this provider_id. Re-registering the same id from a different
+        address is rejected, so a provider's payout wallet can't be
+        silently swapped by someone else.
+        """
         assert len(provider_id) < 16
+        assert all(c.isalnum() or c == '_' for c in provider_id), "provider_id must be alphanumeric/underscore"
         assert len(provider_data_json) < 4096
         data = json.loads(provider_data_json)
-        # hard-required fields — cheap deterministic validation, no LLM needed
         for field in ("gpu_type", "vram_gb", "cost_per_hr", "reliability_pct", "queue_wait_min"):
             assert field in data, f"missing field: {field}"
+
+        existing_payout = self.provider_payout.get(provider_id, ZERO_ADDR)
+        if existing_payout != ZERO_ADDR:
+            assert gl.message.sender_address == existing_payout, "provider_id already owned by a different address"
+        else:
+            self.provider_payout[provider_id] = gl.message.sender_address
+
         self.provider_registry[provider_id] = provider_data_json
         existing = self.provider_id_list or ""
         ids = [x for x in existing.split(",") if x]
@@ -55,6 +75,11 @@ class ComputeRouter(gl.Contract):
         """
         job_spec_json: {"vram_needed_gb": 24, "gpu_type_pref": "A100", "est_hours": 3}
         priorities_json: {"cost": 0-10, "speed": 0-10, "reliability": 0-10}
+
+        Assigns a fresh job_id and records which provider it was routed
+        to in `routed_jobs`. fund_escrow() later checks against this
+        record, so escrow can only ever be opened for a job that was
+        actually routed to the provider it names.
         """
         assert len(job_spec_json) < 4096
         job = json.loads(job_spec_json)
@@ -118,9 +143,6 @@ class ComputeRouter(gl.Contract):
                     return False
                 if data["provider"] not in providers:
                     return False
-                # semantic defensibility check: reasoning must engage with
-                # at least one of the stated priority dimensions, not just
-                # restate the provider id
                 rl = data["reasoning"].lower()
                 if len(rl) <= 10:
                     return False
@@ -134,32 +156,68 @@ class ComputeRouter(gl.Contract):
 
         routing = parse_result(gl.vm.run_nondet_unsafe(leader_fn, validator_fn))
         chosen = routing.get("provider", list(providers.keys())[0])
+
+        job_id = "job-" + str(int(self.job_counter))
+        self.job_counter = u32(int(self.job_counter) + 1)
+        self.routed_jobs[job_id] = chosen
+
+        routing["job_id"] = job_id
         routing["priorities"] = {"cost": cost_p, "speed": speed_p, "reliability": rel_p}
         routing["provider_data"] = providers.get(chosen, {})
         routing["job_spec"] = job
         self.job_history.append(json.dumps(routing))
         return json.dumps(routing)
 
-    @gl.public.write
-    def fund_escrow(self, job_id: str, provider_id: str, amount_str: str):
-        """Lock payment for a routed job; released only on completion proof."""
+    @gl.public.write.payable
+    def fund_escrow(self, job_id: str, provider_id: str):
+        """
+        Locks real GEN for a routed job. The transaction's actual attached
+        value (gl.message.value) becomes the escrowed amount — the caller
+        cannot claim an amount that wasn't really sent. job_id must match
+        a provider_id that route_job genuinely assigned it to, so escrow
+        can't be opened against a job/provider pair that was never routed.
+        """
         assert len(job_id) < 64
-        self.escrow[job_id] = json.dumps({
-            "provider": provider_id, "amount": amount_str, "status": "locked"
+        assert self.routed_jobs.get(job_id, "") == provider_id, \
+            "job_id was not routed to this provider_id"
+        assert self.escrow_meta.get(job_id, "") == "", "job_id already funded"
+        amount = gl.message.value
+        assert int(amount) > 0, "must attach GEN value to fund escrow"
+
+        self.escrow_depositor[job_id] = gl.message.sender_address
+        self.escrow_meta[job_id] = json.dumps({
+            "provider": provider_id,
+            "amount": str(int(amount)),
+            "status": "locked",
         })
 
     @gl.public.write
     def resolve_completion(self, job_id: str, evidence_json: str) -> str:
         """
-        Dispute-style resolution: did the provider actually complete the
-        job? Validators independently reason over submitted evidence
-        (logs/output hash/duration) and reach a defensible — not identical
-        — verdict. This is the same subjective-consensus primitive applied
-        to payment release instead of routing.
+        Non-replayable settlement: only a job whose escrow status is still
+        "locked" can be resolved — once it flips to "released" or
+        "refunded" this reverts on any further call, so funds can never be
+        paid out twice for the same job.
+
+        Only the depositor or the provider's registered payout address may
+        trigger resolution (both have a legitimate stake in the outcome).
+        The leader LLM judges the submitted evidence; validators
+        independently verify the verdict is defensible. On a "completed"
+        verdict, escrowed GEN is transferred on-chain to the provider's
+        payout address; otherwise it's refunded on-chain to the depositor.
         """
-        assert job_id in self.escrow
+        raw = self.escrow_meta.get(job_id, "")
+        assert raw != "", "unknown job_id"
+        record = json.loads(raw)
+        assert record.get("status") == "locked", "job already resolved — no replay"
         assert len(evidence_json) < 8192
-        record = json.loads(self.escrow[job_id])
+
+        provider_id = record["provider"]
+        depositor = self.escrow_depositor.get(job_id, ZERO_ADDR)
+        payout_addr = self.provider_payout.get(provider_id, ZERO_ADDR)
+        caller = gl.message.sender_address
+        assert caller == depositor or caller == payout_addr, \
+            "only the depositor or the provider may resolve this job"
 
         def leader_fn():
             return gl.nondet.exec_prompt(
@@ -180,9 +238,19 @@ class ComputeRouter(gl.Contract):
                 return False
 
         verdict = parse_result(gl.vm.run_nondet_unsafe(leader_fn, validator_fn))
-        record["status"] = "released" if verdict.get("completed") else "disputed"
+        amount = u256(int(record["amount"]))
+        completed = bool(verdict.get("completed"))
+
+        # Flip status BEFORE the transfer so a re-entrant/duplicate call
+        # (or a retried transaction) can never observe "locked" again.
+        record["status"] = "released" if completed else "refunded"
         record["verdict_reasoning"] = verdict.get("reasoning", "")
-        self.escrow[job_id] = json.dumps(record)
+        self.escrow_meta[job_id] = json.dumps(record)
+
+        target = payout_addr if completed else depositor
+        assert target != ZERO_ADDR, "no valid payout target on record"
+        gl.emit_transfer(target, amount)
+
         return json.dumps(record)
 
     @gl.public.view
@@ -210,4 +278,10 @@ class ComputeRouter(gl.Contract):
 
     @gl.public.view
     def get_escrow_status(self, job_id: str) -> str:
-        return self.escrow.get(job_id, "{}")
+        raw = self.escrow_meta.get(job_id, "")
+        if not raw:
+            return "{}"
+        record = json.loads(raw)
+        depositor = self.escrow_depositor.get(job_id, ZERO_ADDR)
+        record["depositor"] = str(depositor)
+        return json.dumps(record)
