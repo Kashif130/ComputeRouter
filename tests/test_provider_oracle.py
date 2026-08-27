@@ -25,7 +25,7 @@ def test_register_provider_requires_owner(direct_vm, direct_deploy, direct_alice
     with pytest.raises(Exception):
         oracle.register_provider("vastA100", json.dumps({
             "gpu_type": "A100", "vram_gb": 80, "cost_per_hr": 1.10,
-        }))
+        }), direct_bob)
 
 
 def test_register_and_read_provider(direct_vm, direct_deploy, direct_alice):
@@ -34,7 +34,7 @@ def test_register_and_read_provider(direct_vm, direct_deploy, direct_alice):
     oracle.set_owner()
     oracle.register_provider("vastA100", json.dumps({
         "gpu_type": "A100", "vram_gb": 80, "cost_per_hr": 1.10,
-    }))
+    }), direct_alice)
     data = json.loads(oracle.get_provider("vastA100"))
     assert data["gpu_type"] == "A100"
     assert data["reliability_pct"] == 100  # no history yet — benefit of the doubt
@@ -46,7 +46,7 @@ def test_reliability_computed_from_history(direct_vm, direct_deploy, direct_alic
     oracle.set_owner()
     oracle.register_provider("ioT4", json.dumps({
         "gpu_type": "T4", "vram_gb": 16, "cost_per_hr": 0.19,
-    }))
+    }), direct_alice)
 
     oracle.record_completion("ioT4", True)
     oracle.record_completion("ioT4", True)
@@ -70,7 +70,7 @@ def test_reliability_not_gameable_by_self_report(direct_vm, direct_deploy, direc
     # payload, get_reliability ignores it and computes from real history.
     oracle.register_provider("shady", json.dumps({
         "gpu_type": "A100", "vram_gb": 80, "cost_per_hr": 0.50, "reliability_pct": 999,
-    }))
+    }), direct_alice)
     oracle.record_completion("shady", False)
     oracle.record_completion("shady", False)
     assert int(oracle.get_reliability("shady")) == 0
@@ -84,7 +84,7 @@ def test_update_pricing_live_within_tolerance(direct_vm, direct_deploy, direct_a
     oracle.set_owner()
     oracle.register_provider("vastA100", json.dumps({
         "gpu_type": "A100", "vram_gb": 80, "cost_per_hr": 1.10,
-    }))
+    }), direct_alice)
 
     direct_vm.mock_web(
         r".*vast\.ai.*",
