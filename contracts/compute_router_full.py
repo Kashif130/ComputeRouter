@@ -2,6 +2,8 @@
 from genlayer import *
 import json
 
+ZERO_ADDR = Address(b'\x00' * 20)
+
 
 def parse_result(raw):
     """Handle both dict (response_format='json') and str (raw text) from exec_prompt."""
@@ -22,16 +24,28 @@ class ComputeRouterFull(gl.Contract):
     Designed for mainnet where cross-contract calls and a second LLM pass
     per validator are affordable. See compute_router.py for the
     testnet-friendly version that avoids the re-reasoning timeout risk.
+
+    Deployment order (see deploy/deploy-compute-studionet.mjs):
+      1. deploy ProviderOracle, call set_owner()
+      2. deploy ComputeRouterFull with NO constructor args
+      3. call set_owner(deployer_address) on THIS contract  <- required
+         before set_oracle() will work, since set_oracle is owner-gated
+         and owner starts as the zero address.
+      4. call set_oracle(oracle_address) on this contract
     """
 
     owner: Address
     provider_oracle_addr: Address
     job_history: DynArray[str]
-    escrow: TreeMap[str, str]
+    job_counter: u32
+
+    routed_jobs: TreeMap[str, str]           # job_id -> provider_id (set only by route_job)
+    escrow_meta: TreeMap[str, str]           # job_id -> {"provider","amount","status"}
+    escrow_depositor: TreeMap[str, Address]  # job_id -> who funded it
 
     @gl.public.write
     def set_owner(self, expected_owner: Address):
-        if self.owner == Address(b'\x00' * 20):
+        if self.owner == ZERO_ADDR:
             assert gl.message.sender_account == expected_owner, "Sender must match expected owner"
             self.owner = expected_owner
         else:
@@ -49,7 +63,7 @@ class ComputeRouterFull(gl.Contract):
     def route_job(self, job_spec_json: str, priorities_json: str) -> str:
         assert len(job_spec_json) < 4096
         assert len(priorities_json) < 1000
-        assert self.provider_oracle_addr != Address(b'\x00' * 20), "Oracle not set"
+        assert self.provider_oracle_addr != ZERO_ADDR, "Oracle not set"
 
         job = json.loads(job_spec_json)
         priorities = json.loads(priorities_json)
@@ -117,7 +131,13 @@ class ComputeRouterFull(gl.Contract):
 
         routing = parse_result(gl.vm.run_nondet_unsafe(leader_fn, validator_fn))
         chosen = routing.get("provider", list(providers.keys())[0])
+
+        job_id = "job-" + str(int(self.job_counter))
+        self.job_counter = u32(int(self.job_counter) + 1)
+        self.routed_jobs[job_id] = chosen
+
         record = {
+            "job_id": job_id,
             "provider": chosen,
             "reasoning": routing.get("reasoning", ""),
             "priorities": {"cost": cost_p, "speed": speed_p, "reliability": rel_p},
@@ -127,18 +147,52 @@ class ComputeRouterFull(gl.Contract):
         self.job_history.append(json.dumps(record))
         return json.dumps(record)
 
-    @gl.public.write
-    def fund_escrow(self, job_id: str, provider_id: str, amount_str: str):
+    @gl.public.write.payable
+    def fund_escrow(self, job_id: str, provider_id: str):
+        """
+        Locks the transaction's real attached GEN (gl.message.value) for a
+        job that route_job actually assigned to provider_id — an escrow
+        can't be opened for a job/provider pair that was never routed.
+        """
         assert len(job_id) < 64
-        self.escrow[job_id] = json.dumps({
-            "provider": provider_id, "amount": amount_str, "status": "locked"
+        assert self.routed_jobs.get(job_id, "") == provider_id, \
+            "job_id was not routed to this provider_id"
+        assert self.escrow_meta.get(job_id, "") == "", "job_id already funded"
+        amount = gl.message.value
+        assert int(amount) > 0, "must attach GEN value to fund escrow"
+
+        self.escrow_depositor[job_id] = gl.message.sender_address
+        self.escrow_meta[job_id] = json.dumps({
+            "provider": provider_id,
+            "amount": str(int(amount)),
+            "status": "locked",
         })
 
     @gl.public.write
     def resolve_completion(self, job_id: str, evidence_json: str) -> str:
-        assert job_id in self.escrow
+        """
+        Non-replayable: only resolves a job still in "locked" status, then
+        immediately flips it to a terminal status before transferring
+        funds, so it can never be resolved twice. Payout address is read
+        live from ProviderOracle (not trusted from caller input). Also
+        relays the verdict to the oracle so reliability scores stay real.
+        """
+        raw = self.escrow_meta.get(job_id, "")
+        assert raw != "", "unknown job_id"
+        record = json.loads(raw)
+        assert record.get("status") == "locked", "job already resolved — no replay"
         assert len(evidence_json) < 8192
-        record = json.loads(self.escrow[job_id])
+        assert self.provider_oracle_addr != ZERO_ADDR, "Oracle not set"
+
+        provider_id = record["provider"]
+        depositor = self.escrow_depositor.get(job_id, ZERO_ADDR)
+        oracle = gl.get_contract_at(self.provider_oracle_addr)
+        payout_addr_str = oracle.view().get_payout_address(provider_id)
+        payout_addr = payout_addr_str if isinstance(payout_addr_str, Address) else Address(payout_addr_str)
+
+        caller = gl.message.sender_address
+        assert caller == depositor or caller == payout_addr, \
+            "only the depositor or the provider may resolve this job"
 
         def leader_fn():
             return gl.nondet.exec_prompt(
@@ -159,9 +213,26 @@ class ComputeRouterFull(gl.Contract):
                 return False
 
         verdict = parse_result(gl.vm.run_nondet_unsafe(leader_fn, validator_fn))
-        record["status"] = "released" if verdict.get("completed") else "disputed"
+        amount = u256(int(record["amount"]))
+        completed = bool(verdict.get("completed"))
+
+        record["status"] = "released" if completed else "refunded"
         record["verdict_reasoning"] = verdict.get("reasoning", "")
-        self.escrow[job_id] = json.dumps(record)
+        self.escrow_meta[job_id] = json.dumps(record)
+
+        target = payout_addr if completed else depositor
+        assert target != ZERO_ADDR, "no valid payout target on record"
+        gl.emit_transfer(target, amount)
+
+        # Best-effort relay to the oracle so reliability reflects real
+        # outcomes. If this contract isn't the oracle's owner the relay
+        # call reverts on the oracle's side only — it must not roll back
+        # the settlement that already happened above, so it's isolated.
+        try:
+            oracle.emit().record_completion(provider_id, completed)
+        except Exception:
+            pass
+
         return json.dumps(record)
 
     @gl.public.view
@@ -178,4 +249,10 @@ class ComputeRouterFull(gl.Contract):
 
     @gl.public.view
     def get_escrow_status(self, job_id: str) -> str:
-        return self.escrow.get(job_id, "{}")
+        raw = self.escrow_meta.get(job_id, "")
+        if not raw:
+            return "{}"
+        record = json.loads(raw)
+        depositor = self.escrow_depositor.get(job_id, ZERO_ADDR)
+        record["depositor"] = str(depositor)
+        return json.dumps(record)
